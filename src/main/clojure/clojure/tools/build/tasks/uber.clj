@@ -18,7 +18,7 @@
   (:import
     [java.io File InputStream IOException OutputStream ByteArrayOutputStream]
     [java.nio.file Files]
-    [java.nio.file.attribute FileAttribute FileTime]
+    [java.nio.file.attribute FileTime]
     [java.util.jar JarEntry JarInputStream JarOutputStream Manifest]))
 
 (set! *warn-on-reflection* true)
@@ -105,16 +105,19 @@
   (throw (ex-info (str "Conflicting path at " path " from " lib) {})))
 
 (defn- handler-emit
-  [^FileTime last-modified-time buffer out-dir path write-spec]
+  [^FileTime last-modified-time buffer entries path write-spec]
   (let [{:keys [string stream append] :or {append false}} write-spec
-        out-file (jio/file out-dir path)]
+        existing-content (when append (:content (get @entries path)))
+        baos (ByteArrayOutputStream.)]
+    (when (and append existing-content)
+      (.write baos ^bytes existing-content 0 (alength ^bytes existing-content)))
     (if string
-      (spit out-file string :append ^boolean append)
-      (copy-stream! ^InputStream stream (jio/output-stream out-file :append append) buffer))
-    (Files/setLastModifiedTime (.toPath out-file) last-modified-time)))
+      (.write baos (.getBytes ^String string "UTF-8"))
+      (copy-stream! ^InputStream stream baos buffer))
+    (swap! entries assoc path {:content (.toByteArray baos) :time last-modified-time})))
 
 (defn- handle-conflict
-  [handlers last-modified-time buffer out-dir {:keys [state path] :as handler-params}]
+  [handlers last-modified-time buffer entries {:keys [state path] :as handler-params}]
   (let [use-handler (loop [[[re handler] & hs] (dissoc handlers :default)]
                       (if re
                         (if (re-matches re path)
@@ -122,51 +125,45 @@
                           (recur hs))
                         (:default handlers)))]
     (if use-handler
-      (let [{new-state :state, write :write} (use-handler handler-params)]
+      (let [existing-bytes (:content (get @entries path))
+            existing-file (when existing-bytes
+                            (let [f (File/createTempFile "uber-conflict" nil)]
+                              (.deleteOnExit f)
+                              (Files/write (.toPath f) ^bytes existing-bytes ^"[Ljava.nio.file.OpenOption;" (into-array java.nio.file.OpenOption []))
+                              f))
+            handler-params (assoc handler-params :existing existing-file)
+            {new-state :state, write :write} (use-handler handler-params)]
+        (when existing-file (.delete existing-file))
         (when write
           (doseq [[path write-spec] write]
-            (handler-emit last-modified-time buffer out-dir path write-spec)))
+            (handler-emit last-modified-time buffer entries path write-spec)))
         (or new-state state))
       (throw (ex-info (format "No handler found for conflict at %s" path) {})))))
 
-(defn- ensure-dir
-  "Returns true if parent dir exists, false if exists but is not a file,
-  and throws if it cannot be created."
-  [^File parent ^File child]
-  (if (.exists parent)
-    (.isDirectory parent)
-    (if (jio/make-parents child)
-      true
-      (throw (ex-info (str "Unable to create parent dirs for: " (.toString child)) {})))))
-
 (defn- explode1
-  "Given one entry/src file, copy to target pursuant to excludes and handlers.
+  "Given one entry/src file, accumulate into entries map pursuant to excludes and handlers.
    Returns possibly updated state for further exploding."
   [^InputStream is ^String path dir? ^FileTime last-modified-time
-   ^File out-file lib {:keys [out-dir buffer exclude handlers] :as context} state]
+   lib {:keys [buffer exclude handlers entries] :as _context} state]
   (cond
     ;; excluded or directory - do nothing
     (or (exclude-from-uber? exclude path) dir?)
     state
 
     ;; conflict, same file from multiple sources - handle
-    (.exists out-file)
-    (handle-conflict handlers last-modified-time buffer out-dir
-                     {:lib lib, :path path, :in is, :existing out-file, :state state})
+    (contains? @entries path)
+    (handle-conflict handlers last-modified-time buffer entries
+                     {:lib lib, :path path, :in is, :state state})
 
-    ;; write new file, parent dir exists for writing
-    (ensure-dir (.getParentFile out-file) out-file)
-    (do
-      (copy-stream! ^InputStream is (jio/output-stream out-file) buffer)
-      (Files/setLastModifiedTime (.toPath out-file) last-modified-time)
-      state)
-
-    :parent-dir-is-a-file
-    (throw (ex-info (format "Cannot write %s from %s as parent dir is a file from another lib. One of them must be excluded."
-                            path lib) {}))))
+    ;; new entry - accumulate into entries map
+    :else
+    (let [baos (ByteArrayOutputStream.)]
+      (copy-stream! ^InputStream is baos buffer)
+      (swap! entries assoc path {:content (.toByteArray baos) :time last-modified-time})
+      state)))
 
 (defn- explode
-  [^File lib-file lib {:keys [out-dir buffer exclude handlers] :as context} state]
+  [^File lib-file lib {:keys [buffer exclude handlers entries] :as context} state]
   (cond
     (not (.exists lib-file))
     state
@@ -177,11 +174,10 @@
         (if-let [entry (.getNextJarEntry jis)]
           (let [path (.getName entry)
                 ;; should rarely happen (except /), but chop to make relative:
-                path (if (str/starts-with? path "/") (subs path 1) path)
-                out-file (jio/file out-dir path)]
+                path (if (str/starts-with? path "/") (subs path 1) path)]
             (recur
              (explode1 jis path (.isDirectory entry) (.getLastModifiedTime ^JarEntry entry)
-                       out-file lib context the-state)))
+                       lib context the-state)))
           the-state)))
 
     (.isDirectory lib-file)
@@ -198,9 +194,8 @@
                                          {:path (.getPath f)} e)))))
                 new-state (try
                             (let [path (str/replace (.toString (.relativize source-path (.toPath f))) \\ \/)
-                                  source-time (FileTime/fromMillis (.lastModified f))
-                                  out-file (jio/file out-dir path)]
-                              (explode1 is path (.isDirectory f) source-time out-file lib context the-state))
+                                  source-time (FileTime/fromMillis (.lastModified f))]
+                              (explode1 is path (.isDirectory f) source-time lib context the-state))
                             (finally
                               (when is (.close ^InputStream is))))]
             (recur restf new-state))
@@ -268,35 +263,55 @@
 
 (defn uber
   [{mf-attrs :manifest, :keys [basis class-dir uber-file main exclude conflict-handlers]}]
-  (let [working-dir (.toFile (Files/createTempDirectory "uber" (into-array FileAttribute [])))
-        context {:out-dir working-dir
+  (let [entries (atom {})
+        context {:entries entries
                  :buffer (byte-array 4096)
                  :handlers (prep-handlers conflict-handlers)
-                 :exclude (map re-pattern (into uber-exclusions exclude))}]
-    (try
-      (let [{:keys [libs]} basis
-            compile-dir (api/resolve-path class-dir)
-            manifest (Manifest.)
-            uber-file (api/resolve-path uber-file)
-            mf-attr-strs (reduce-kv (fn [m k v] (assoc m (str k) (str v))) nil mf-attrs)]
+                 :exclude (map re-pattern (into uber-exclusions exclude))}
+        {:keys [libs]} basis
+        compile-dir (api/resolve-path class-dir)
+        manifest (Manifest.)
+        uber-file (api/resolve-path uber-file)
+        mf-attr-strs (reduce-kv (fn [m k v] (assoc m (str k) (str v))) nil mf-attrs)]
+    (reduce
+      (fn [state [lib coord]]
         (reduce
-          (fn [state [lib coord]]
-            (reduce
-              (fn [state path] (explode (jio/file path) lib context state))
-              state (:paths coord)))
-          nil ;; initial state, usable by handlers if needed
-          (assoc (remove-optional libs) nil {:paths [compile-dir]}))
-        (zip/fill-manifest! manifest
-          (merge
-            (cond->
-              {"Manifest-Version" "1.0"
-               "Created-By" "org.clojure/tools.build"
-               "Build-Jdk-Spec" (System/getProperty "java.specification.version")}
-              main (assoc "Main-Class" (str/replace (str main) \- \_))
-              (.exists (jio/file working-dir "META-INF" "versions")) (assoc "Multi-Release" "true"))
-            mf-attr-strs))
-        (file/ensure-dir (.getParent uber-file))
-        (with-open [jos (JarOutputStream. (jio/output-stream uber-file) manifest)]
-          (zip/copy-to-zip jos working-dir)))
-      (finally
-        (file/delete working-dir)))))
+          (fn [state path] (explode (jio/file path) lib context state))
+          state (:paths coord)))
+      nil ;; initial state, usable by handlers if needed
+      (assoc (remove-optional libs) nil {:paths [compile-dir]}))
+    (zip/fill-manifest! manifest
+      (merge
+        (cond->
+          {"Manifest-Version" "1.0"
+           "Created-By" "org.clojure/tools.build"
+           "Build-Jdk-Spec" (System/getProperty "java.specification.version")}
+          main (assoc "Main-Class" (str/replace (str main) \- \_))
+          (some #(str/starts-with? (key %) "META-INF/versions/") @entries) (assoc "Multi-Release" "true"))
+        mf-attr-strs))
+    (file/ensure-dir (.getParent uber-file))
+    (with-open [jos (JarOutputStream. (jio/output-stream uber-file) manifest)]
+      ;; collect all parent directory paths implied by file entries
+      (let [all-entries @entries
+            dirs (->> (keys all-entries)
+                      (mapcat (fn [^String path]
+                                (loop [parts (str/split path #"/") acc [] dirs []]
+                                  (if (next parts)
+                                    (let [dir (str (str/join "/" (conj acc (first parts))) "/")]
+                                      (recur (next parts) (conj acc (first parts)) (conj dirs dir)))
+                                    dirs))))
+                      (into (sorted-set)))]
+        ;; write directory entries first
+        (doseq [^String dir dirs]
+          (let [jar-entry (JarEntry. dir)]
+            (.putNextEntry jos jar-entry)
+            (.closeEntry jos)))
+        ;; write file entries
+        (doseq [[path entry] (sort-by key all-entries)]
+          (let [^bytes content (:content entry)
+                ^FileTime time (:time entry)
+                jar-entry (doto (JarEntry. ^String path)
+                            (.setLastModifiedTime time))]
+            (.putNextEntry jos jar-entry)
+            (.write jos content 0 (alength content))
+            (.closeEntry jos)))))))
